@@ -1,399 +1,205 @@
-import io
-import logging
-import json
-from typing import List, Dict, Any
-
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+import io
 from openai import OpenAI
-from rapidfuzz import fuzz
-from sklearn.cluster import AgglomerativeClustering
-from semhash import SemHash
-import spacy
+from sklearn.metrics.pairwise import cosine_similarity
+import networkx as nx
 
-# -----------------------------
-# Page Configuration
-# -----------------------------
-st.set_page_config(
-    page_title="🔍 Groupowanie fraz → Excel Brief Pipeline",
-    initial_sidebar_state="expanded"
-)
+# -------------------------------------
+# Konfiguracja strony
+# -------------------------------------
+st.set_page_config(page_title="🔎 Ukryta kanibalizacja (pełny raport)", layout="wide")
 
-st.sidebar.header("⚙️ Configuration")
+st.title("🔎 Analiza ukrytej kanibalizacji + scalanie briefów z wytycznymi + finalny raport")
 
 # API Key
 OPENAI_API_KEY = st.sidebar.text_input("OpenAI API Key", type="password")
 
-# Models - wybór z listy
-OPENAI_EMBEDDING_MODEL = st.sidebar.selectbox(
-    "Model embeddingów",
-    ["text-embedding-3-large", "text-embedding-3-small"],
-    index=0
-)
+# Parametry
+threshold = st.sidebar.slider("Próg podobieństwa (cosine similarity)", 0.70, 0.95, 0.80, 0.01)
 
-OPENAI_CHAT_MODEL = st.sidebar.selectbox(
-    "Model czatu",
-    ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
-    index=0
-)
+# Upload pliku
+uploaded_file = st.file_uploader("Wgraj plik briefy_pelne.xlsx (z poprzedniego etapu)", type=["xlsx"])
 
-# Parameters with explanations
-DEDUP_THRESHOLD = st.sidebar.slider(
-    "Deduplication Threshold (RapidFuzz)", 0, 100, 85, 1
-)
-CLUSTER_SIM = st.sidebar.slider(
-    "Initial Clustering Similarity Threshold", 0.0, 1.0, 0.80, 0.01
-)
-MERGE_SIM = st.sidebar.slider(
-    "Cluster Merge Similarity Threshold", 0.0, 1.0, 0.85, 0.01
-)
-SEMHASH_SIM = st.sidebar.slider(
-    "SemHash Similarity Threshold", 0.80, 0.99, 0.95, 0.01
-)
-USE_SEMHASH = st.sidebar.checkbox("Użyj SemHash do deduplikacji", value=False)
 
-# -----------------------------
-# Parametry – objaśnienia
-# -----------------------------
-st.sidebar.markdown("### ℹ️ Objaśnienia parametrów")
-st.sidebar.info("""
-**Deduplication Threshold (RapidFuzz)** – próg podobieństwa (0–100), powyżej którego frazy są traktowane jako duplikaty.  
-Przykład: „gotowanie kukurydzy” i „jak gotować kukurydzę” przy 85 będą scalone.
-
-**Initial Clustering Similarity Threshold** – minimalne podobieństwo (0–1), żeby frazy trafiły do tego samego klastra na początku.  
-Niższa wartość = większe grupy.
-
-**Cluster Merge Similarity Threshold** – próg podobieństwa (0–1), przy którym łączymy całe klastry w większe grupy.  
-Wyższa wartość = mniej łączenia.
-
-**SemHash Similarity Threshold** – używane, gdy zaznaczysz opcję SemHash. Określa, jak semantycznie bliskie muszą być frazy, żeby uznać je za duplikaty.
-""")
-
-# -----------------------------
-# NLP – Lematyzacja (spaCy)
-# -----------------------------
-@st.cache_resource
-def load_spacy():
-    try:
-        return spacy.load("pl_core_news_sm")
-    except:
-        st.warning("⚠️ Musisz zainstalować model spaCy: python -m spacy download pl_core_news_sm")
-        return None
-
-nlp = load_spacy()
-
-def lemmatize_texts(texts: List[str]) -> List[str]:
-    """Zwraca lematy tekstów (używane tylko do embeddingów)."""
-    if not nlp:
-        return texts
-    return [" ".join([token.lemma_.lower() for token in nlp(t)]) for t in texts]
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def deduplicate(questions: List[str], threshold: int = 85) -> List[str]:
-    unique = []
-    for q in questions:
-        if not any(fuzz.ratio(q, u) >= threshold for u in unique):
-            unique.append(q)
-    return unique
-
-def semhash_deduplicate(questions: List[str], threshold: float = 0.95) -> List[str]:
-    try:
-        sh = SemHash.from_records(records=questions)
-        result = sh.self_deduplicate(threshold=threshold)
-        if hasattr(result, "selected"):
-            return result.selected
-        elif hasattr(result, "deduplicated"):
-            return result.deduplicated
-        elif isinstance(result, list):
-            return result
-        else:
-            return deduplicate(questions, threshold=90)
-    except Exception as e:
-        logging.warning(f"⚠️ SemHash failed ({e}) → fallback RapidFuzz")
-        return deduplicate(questions, threshold=90)
-
-def embed_texts(client: OpenAI, texts: List[str], model=OPENAI_EMBEDDING_MODEL) -> np.ndarray:
+# -------------------------------------
+# Funkcja do embeddingów
+# -------------------------------------
+def get_embeddings(texts, client, model="text-embedding-3-large"):
     response = client.embeddings.create(model=model, input=texts)
     return np.array([d.embedding for d in response.data])
 
-def cluster_questions(questions: List[str], embeddings: np.ndarray, sim_threshold=0.8) -> Dict[int, List[str]]:
-    if not questions:
-        return {}
-    clustering = AgglomerativeClustering(
-        n_clusters=None,
-        metric="cosine",
-        linkage="average",
-        distance_threshold=1 - sim_threshold,
+
+# -------------------------------------
+# Funkcje do scalania tytułów i wytycznych
+# -------------------------------------
+def merge_title(titles, client):
+    """Scalanie wielu tytułów w jeden dominujący"""
+    text = " | ".join(set([t for t in titles if isinstance(t, str) and t.strip() != ""]))
+    if not text:
+        return ""
+    prompt = f"""
+    Na podstawie poniższych tytułów scalonych artykułów stwórz JEDEN nowy tytuł,
+    który najlepiej oddaje ich wspólny sens.
+    Tytuł powinien być zwięzły, naturalny i SEO-friendly (maksymalnie 70 znaków).
+    Bez cudzysłowów, bez znaków specjalnych.
+
+    {text}
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=50
     )
-    labels = clustering.fit_predict(embeddings)
-    clustered: Dict[int, List[str]] = {}
-    for label, q in zip(labels, questions):
-        clustered.setdefault(int(label), []).append(q)
-    return clustered
+    return response.choices[0].message.content.strip()
 
-def merge_similar_clusters(clusters: Dict[int, List[str]], embeddings: np.ndarray, sim_threshold=0.85, q2i: Dict[str, int] = None) -> Dict[int, List[str]]:
-    if not clusters:
-        return {}
-    centroids = {}
-    for cid, qs in clusters.items():
-        idxs = [q2i[q] for q in qs if q in q2i]
-        if not idxs:
-            continue
-        centroid = np.mean(embeddings[idxs], axis=0)
-        centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
-        centroids[cid] = centroid
 
-    merged: Dict[int, List[str]] = {}
-    used = set()
-    new_id = 0
-    cluster_ids = list(clusters.keys())
-
-    for cid in cluster_ids:
-        if cid in used or cid not in centroids:
-            continue
-        merged[new_id] = list(clusters[cid])
-        used.add(cid)
-        for cid2 in cluster_ids:
-            if cid2 in used or cid2 not in centroids:
-                continue
-            sim = float(np.dot(centroids[cid], centroids[cid2]))
-            if sim >= sim_threshold:
-                merged[new_id].extend(clusters[cid2])
-                used.add(cid2)
-        new_id += 1
-    return merged
-
-def global_deduplicate_clusters(clusters: Dict[int, List[str]], threshold: int = 90) -> Dict[int, List[str]]:
-    seen = []
-    new_clusters: Dict[int, List[str]] = {}
-    for cid, qs in clusters.items():
-        unique_qs = []
-        for q in qs:
-            if not any(fuzz.ratio(q, s) >= threshold for s in seen):
-                unique_qs.append(q)
-                seen.append(q)
-        if unique_qs:
-            new_clusters[cid] = unique_qs
-    return new_clusters
-
-def validate_clusters_with_llm(clusters: Dict[int, List[str]], client: OpenAI, model: str = "gpt-4o-mini") -> Dict[int, List[str]]:
-    if not clusters:
-        return clusters
-
-    id2cid = {i: cid for i, cid in enumerate(clusters.keys())}
-    clusters_list = [f"Cluster {i}: {', '.join(qs)}" for i, (cid, qs) in enumerate(clusters.items())]
-
+def merge_guidelines(guidelines, client):
+    """Scalanie wielu wytycznych w jedne spójne"""
+    text = " | ".join(set([g for g in guidelines if isinstance(g, str) and g.strip() != ""]))
+    if not text:
+        return ""
     prompt = f"""
-Masz listę klastrów fraz. Twoim zadaniem jest sprawdzić, czy któreś klastry znaczą to samo.
-⚠️ Bardzo ważne zasady:
-- Scalaj TYLKO wtedy, gdy frazy są prawie identyczne (synonimy, odmiana, szyk słów).
-- NIE łącz klastrów, jeśli dotyczą różnych kontekstów (np. ceny ≠ dzieci, gotowanie ≠ ceny).
-- Uwzględnij lematyzację – jeśli frazy różnią się tylko formą gramatyczną, SCAL je.
-- Unikaj łączenia, które mogłoby prowadzić do kanibalizacji SEO (dwa różne tematy artykułów nie mogą być scalone).
-- Jeżeli masz wątpliwości, NIE scalaj.
+    Na podstawie poniższych wytycznych scal je w jedne spójne i całościowe
+    wskazówki dla autora artykułu. Napisz zwięźle w 1-2 zdaniach.
+    Bez cudzysłowów, bez znaków specjalnych.
 
-Lista klastrów:
-{chr(10).join(clusters_list)}
+    {text}
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=80
+    )
+    return response.choices[0].message.content.strip()
 
-Odpowiedz w JSON, w formacie:
-{{
-  "scalone": [
-    {{"id": [0, 3]}},
-    {{"id": [1]}},
-    {{"id": [2, 5]}}
-  ]
-}}
-"""
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "Jesteś asystentem SEO. Zwracasz tylko czysty JSON zgodny z formatem."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
+
+# -------------------------------------
+# Logika główna
+# -------------------------------------
+if uploaded_file and OPENAI_API_KEY:
+    progress = st.progress(0)
+    status = st.empty()
+
+    df = pd.read_excel(uploaded_file)
+    st.subheader("📊 Podgląd danych wejściowych")
+    st.dataframe(df.head())
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # --- krok 1: wybór tylko pojedynczych ---
+    singles = df[df["status"] == "pojedynczy"].reset_index(drop=True)
+    titles = singles["tytul"].astype(str).tolist()
+    ids = singles["cluster_ids"].astype(str).tolist()
+    n = len(singles)
+
+    status.text(f"📥 Załadowano {n} pojedynczych klastrów do analizy...")
+    progress.progress(20)
+
+    # --- krok 2: embeddingi ---
+    status.text("🧠 Tworzenie embeddingów dla tytułów...")
+    embeddings = get_embeddings(titles, client, "text-embedding-3-large")
+    progress.progress(50)
+
+    # --- krok 3: macierz podobieństw ---
+    status.text("🔍 Obliczanie podobieństw między tytułami...")
+    sim_matrix = cosine_similarity(embeddings)
+    pairs = []
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            sim = sim_matrix[i, j]
+            if sim >= threshold:
+                pairs.append({
+                    "cluster_id_1": ids[i],
+                    "title_1": titles[i],
+                    "cluster_id_2": ids[j],
+                    "title_2": titles[j],
+                    "similarity": round(float(sim), 4)
+                })
+    progress.progress(70)
+
+    # --- krok 4: wyniki par ---
+    if pairs:
+        results_df = pd.DataFrame(pairs).sort_values(by="similarity", ascending=False).reset_index(drop=True)
+        st.subheader("📑 Podejrzane pary (ukryta kanibalizacja)")
+        st.dataframe(results_df)
+
+        # --- krok 5: grupowanie par w klastry ---
+        G = nx.Graph()
+        for _, row in results_df.iterrows():
+            G.add_edge(row["cluster_id_1"], row["cluster_id_2"])
+
+        groups = list(nx.connected_components(G))
+        group_data = []
+        for i, g in enumerate(groups, start=1):
+            group_titles = singles[singles["cluster_ids"].isin(g)]["tytul"].tolist()
+            group_data.append({
+                "group_id": i,
+                "titles": group_titles,
+                "count": len(group_titles)
+            })
+        grouped_df = pd.DataFrame(group_data)
+        st.subheader("📦 Zgrupowane klastry kanibalizacji")
+        st.dataframe(grouped_df)
+
+        # --- krok 6: scalone briefy z nowym tytułem i wytycznymi ---
+        briefs = []
+        for i, g in enumerate(groups, start=1):
+            group_df = singles[singles["cluster_ids"].isin(g)]
+
+            main_phrase = group_df["main_phrase"].iloc[0]
+            intent = group_df["intencja"].mode()[0] if not group_df["intencja"].mode().empty else group_df["intencja"].iloc[0]
+
+            merged_phrases = ", ".join(set(group_df["frazy"].dropna()))
+            merged_ids = ", ".join(map(str, group_df["cluster_ids"].tolist()))
+
+            merged_title = merge_title(group_df["tytul"].dropna().tolist(), client)
+            merged_guidelines = merge_guidelines(group_df["wytyczne"].dropna().tolist(), client) if "wytyczne" in group_df.columns else ""
+
+            briefs.append({
+                "status": "scalone_2etap",
+                "group_id": i,
+                "cluster_ids": merged_ids,
+                "main_phrase": main_phrase,
+                "intencja": intent,
+                "frazy": merged_phrases,
+                "tytul": merged_title,
+                "wytyczne": merged_guidelines
+            })
+
+        briefs_df = pd.DataFrame(briefs)
+        st.subheader("📝 Briefy dla scalonych klastrów (2 etap, z jednym tytułem i wytycznymi)")
+        st.dataframe(briefs_df)
+
+        # --- krok 7: przygotowanie finalnego zestawienia ---
+        scalone_ids = set(",".join(briefs_df["cluster_ids"]).split(", "))
+        df_filtered = df[~df["cluster_ids"].astype(str).isin(scalone_ids)]
+
+        final_df = pd.concat([df_filtered, briefs_df], ignore_index=True)
+
+        # --- eksport ---
+        xlsx_buffer = io.BytesIO()
+        with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Briefy_oryginalne", index=False)  # wszystkie oryginalne (pojedyncze + scalone_1etap)
+            results_df.to_excel(writer, sheet_name="Ukryta_kanibalizacja", index=False)
+            grouped_df.to_excel(writer, sheet_name="Grupy", index=False)
+            briefs_df.to_excel(writer, sheet_name="Briefy_scalone_2etap", index=False)
+            final_df.to_excel(writer, sheet_name="Finalne_briefy", index=False)
+
+        xlsx_buffer.seek(0)
+
+        st.download_button(
+            label="📥 Pobierz pełny raport (Finalne briefy)",
+            data=xlsx_buffer,
+            file_name="pelny_raport_briefow.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        content = resp.choices[0].message.content.strip()
-        st.subheader("📑 Surowa odpowiedź LLM (walidacja klastrów)")
-        st.code(content, language="json")
 
-        start = content.find("{")
-        end = content.rfind("}")
-        if start != -1 and end != -1:
-            json_str = content[start:end+1]
-        else:
-            raise ValueError("⚠️ Brak poprawnego JSON w odpowiedzi LLM")
+        status.text("✅ Zakończono!")
+        progress.progress(100)
 
-        data = json.loads(json_str)
-
-        merged: Dict[int, List[str]] = {}
-        scalone_info = []
-        new_id = 0
-        used_ids = set()
-
-        for group in data.get("scalone", []):
-            combined = []
-            ids = group.get("id", [])
-            for idx in ids:
-                cid = id2cid.get(idx)
-                if cid in clusters:
-                    combined.extend(clusters[cid])
-                    used_ids.add(idx)
-            if combined:
-                merged[new_id] = combined
-                scalone_info.append(f"Scalono klastry {ids} → {combined}")
-                new_id += 1
-
-        all_ids = set(id2cid.keys())
-        leftover_ids = all_ids - used_ids
-        for idx in leftover_ids:
-            cid = id2cid.get(idx)
-            if cid in clusters:
-                merged[new_id] = clusters[cid]
-                scalone_info.append(f"Zachowano klaster {idx} → {clusters[cid]}")
-                new_id += 1
-
-        if scalone_info:
-            st.subheader("📊 Raport scalania klastrów")
-            for line in scalone_info:
-                st.write(line)
-
-        return merged if merged else clusters
-    except Exception as e:
-        logging.warning(f"⚠️ Cluster validation with LLM failed: {e}")
-        return clusters
-
-def generate_article_brief(questions: List[str], client: OpenAI | None, model: str = "gpt-4o-mini") -> Dict[str, Any]:
-    if client is None:
-        return {"intencja": "", "frazy": ", ".join(questions), "tytul": "", "wytyczne": ""}
-    prompt = f"""
-Dla poniższej listy fraz przygotuj dane do planu artykułu.
-
-Frazy: {questions}
-
-Odpowiedz w formacie:
-
-Intencja: [typ intencji wyszukiwania]
-Frazy: [lista fraz long-tail, rozdzielona przecinkami]
-Tytuł: [SEO-friendly, max 70 znaków, naturalny, z głównym keywordem]
-Wytyczne: [2–3 zdania opisu oczekiwań użytkownika]
-"""
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "Jesteś asystentem SEO. Zawsze trzymaj się formatu."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.7,
-        )
-        content = resp.choices[0].message.content.strip()
-        result = {"intencja": "", "frazy": "", "tytul": "", "wytyczne": ""}
-        for line in content.splitlines():
-            low = line.lower()
-            if low.startswith("intencja:"):
-                result["intencja"] = line.split(":", 1)[1].strip()
-            elif low.startswith("frazy:"):
-                result["frazy"] = line.split(":", 1)[1].strip()
-            elif low.startswith("tytuł:") or low.startswith("tytul:"):
-                result["tytul"] = line.split(":", 1)[1].strip()
-            elif low.startswith("wytyczne:"):
-                result["wytyczne"] = line.split(":", 1)[1].strip()
-        result["frazy"] = result["frazy"] or ", ".join(questions)
-        return result
-    except Exception as e:
-        logging.warning(f"⚠️ Brief parse failed: {e}")
-        return {"intencja": "", "frazy": ", ".join(questions), "tytul": "", "wytyczne": ""}
-
-# -----------------------------
-# Main App
-# -----------------------------
-st.title("🔍 Groupowanie fraz → Excel Brief Pipeline")
-
-status = st.empty()
-progress_bar = st.progress(0)
-log_box = st.container()
-
-def update_status(message: str, progress: int):
-    status.text(message)
-    progress_bar.progress(progress)
-    log_box.write(message)
-
-phrases_input = st.sidebar.text_area("Wklej frazy, jedna na linię:")
-
-if st.sidebar.button("Uruchom grupowanie"):
-    if not phrases_input.strip():
-        st.warning("⚠️ Wklej najpierw listę fraz.")
-        st.stop()
-
-    if not OPENAI_API_KEY:
-        st.error("⚠️ Podaj OpenAI API Key w panelu bocznym.")
-        st.stop()
-
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-    questions = [line.strip() for line in phrases_input.splitlines() if line.strip()]
-    update_status(f"📥 Wczytano frazy: {len(questions)}", 5)
-
-    if USE_SEMHASH:
-        filtered = semhash_deduplicate(questions, threshold=SEMHASH_SIM)
-        update_status(f"🧹 Deduplication (SemHash {SEMHASH_SIM}): {len(questions)} → {len(filtered)}", 15)
     else:
-        filtered = deduplicate(questions, threshold=DEDUP_THRESHOLD)
-        update_status(f"🧹 Deduplication (RapidFuzz {DEDUP_THRESHOLD}): {len(questions)} → {len(filtered)}", 15)
+        st.success("✅ Nie wykryto podejrzanych par powyżej progu podobieństwa.")
 
-    update_status("🧠 Generowanie embeddingów...", 35)
-    lemmatized = lemmatize_texts(filtered)
-    embeddings = embed_texts(openai_client, lemmatized, model=OPENAI_EMBEDDING_MODEL)
-    q2i = {q: i for i, q in enumerate(filtered)}
-
-    clusters = cluster_questions(filtered, embeddings, sim_threshold=CLUSTER_SIM)
-    update_status(f"🧩 Klastrowanie fraz: powstało {len(clusters)} klastrów", 55)
-
-    clusters = merge_similar_clusters(clusters, embeddings, sim_threshold=MERGE_SIM, q2i=q2i)
-    update_status(f"🔗 Scalanie podobnych klastrów (próg {MERGE_SIM}): teraz {len(clusters)} klastrów", 70)
-
-    clusters = global_deduplicate_clusters(clusters, threshold=90)
-    update_status(f"🧽 Usuwanie duplikatów między klastrami: {len(clusters)} końcowych klastrów", 85)
-
-    clusters = validate_clusters_with_llm(clusters, openai_client, model=OPENAI_CHAT_MODEL)
-    update_status(f"🤖 Walidacja LLM: {len(clusters)} klastrów po scaleniu semantycznym", 90)
-
-    rows = []
-    total = len(clusters)
-    for i, (label, qs) in enumerate(clusters.items(), 1):
-        update_status(f"📝 Generuję brief {i}/{total} ({len(qs)} fraz)", int(95 * i / total))
-        brief = generate_article_brief(qs, openai_client, model=OPENAI_CHAT_MODEL)
-        rows.append({
-            "cluster_id": label,
-            "main_phrase": qs[0] if qs else "",   # fraza główna
-            "intencja": brief.get("intencja", ""),
-            "frazy": ", ".join(qs),
-            "tytul": brief.get("tytul", ""),
-            "wytyczne": brief.get("wytyczne", ""),
-        })
-
-    df = pd.DataFrame(rows)
-    xlsx_buffer = io.BytesIO()
-    with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Briefs", index=False)
-    xlsx_buffer.seek(0)
-
-    st.session_state["excel_buffer"] = xlsx_buffer.getvalue()
-    st.session_state["results"] = rows
-
-    update_status("✅ Gotowe!", 100)
-
-if "excel_buffer" in st.session_state:
-    st.download_button(
-        label="📥 Pobierz Excel",
-        data=st.session_state["excel_buffer"],
-        file_name="frazy_briefy.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.success("✅ Zakończono przetwarzanie.")
-    st.subheader("📊 Podgląd wyników")
-    st.dataframe(pd.DataFrame(st.session_state["results"]))
