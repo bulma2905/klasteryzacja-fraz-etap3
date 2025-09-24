@@ -17,7 +17,7 @@ st.title("🔎 Analiza ukrytej kanibalizacji + scalanie briefów z wytycznymi + 
 OPENAI_API_KEY = st.sidebar.text_input("OpenAI API Key", type="password")
 
 # Parametry
-threshold = st.sidebar.slider("Próg podobieństwa (cosine similarity)", 0.70, 0.95, 0.80, 0.01)
+threshold = st.sidebar.slider("Próg podobieństwa (cosine similarity)", 0.40, 0.95, 0.80, 0.01)
 
 # Upload pliku
 uploaded_file = st.file_uploader("Wgraj plik briefy_pelne.xlsx (z poprzedniego etapu)", type=["xlsx"])
